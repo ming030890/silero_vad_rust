@@ -10,28 +10,18 @@ fn main() {
     }
 
     let wav_path = &args[1];
-    println!("Loading Silero VAD model...");
     let mut detector = Detector::default();
 
-    println!("Processing: {} ...", wav_path);
-    let probs = match detector.predict_wav(wav_path) {
-        Ok(p) => p,
+    let timestamps = match detector.predict_wav(wav_path) {
+        Ok(ts) => ts,
         Err(e) => {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
     };
 
-    let threshold = 0.5f32;
-    println!("------------------------------------------------------------");
-    println!("| Chunk  | Timestamp (s) | Prob     | Speech Decision (>0.5) |");
-    println!("------------------------------------------------------------");
-
-    for (i, &prob) in probs.iter().enumerate() {
-        let timestamp_s = (i * 512) as f64 / 16000.0;
-        let is_speech = if prob >= threshold { "SPEECH" } else { "silence" };
-        println!("| {:<6} | {:<13.3} | {:<8.4} | {:<22} |", i, timestamp_s, prob, is_speech);
+    println!("Detected {} speech segment(s):", timestamps.len());
+    for (i, ts) in timestamps.iter().enumerate() {
+        println!("  [{:>3}] {:>8.3}s – {:>8.3}s  ({:.3}s)", i, ts.start, ts.end, ts.end - ts.start);
     }
-    println!("------------------------------------------------------------");
-    println!("Inference completed successfully!");
 }
