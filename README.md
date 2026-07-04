@@ -1,6 +1,6 @@
 # Silero VAD Rust
 
-A lightweight, zero-dependency Rust inference engine for the 16 kHz [Silero VAD](https://github.com/snakers4/silero-vad) model. Drop-in replacement for [`earshot`](https://crates.io/crates/earshot).
+A lightweight, zero-dependency Rust inference engine for the 16 kHz [Silero VAD](https://github.com/snakers4/silero-vad) model.
 
 No PyTorch, ONNX Runtime, tinygrad, or libtorch — the neural network operators are implemented directly in Rust for this one fixed model.
 
@@ -27,13 +27,13 @@ cargo run --release --bin benchmark --features openblas # with BLAS
 ## Quick Start
 
 ```rust
-use silero_vad_rust::Detector;
+use silero_vad_rust::RawDetector;
 
-let mut detector = Detector::default();
+let mut detector = RawDetector::default();
 
 // Stream 512-sample (32 ms) chunks of 16 kHz mono f32 PCM:
 let chunk = vec![0.0f32; 512];
-let score = detector.predict(&chunk);
+let score = detector.predict_f32(&chunk).unwrap();
 if score >= 0.5 {
     println!("Speech detected: {score:.4}");
 }

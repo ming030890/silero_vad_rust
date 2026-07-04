@@ -5,7 +5,7 @@ use crate::silero_vad::{Result, SileroError};
 /// The supported chunk size for the 16 kHz Silero VAD model: 512 samples (32 ms).
 ///
 /// The model was trained on 512, 1024, and 1536 sample windows at 16 kHz.
-/// We support only 512 for streaming use, matching earshot's frame contract.
+/// We support only 512 for streaming use, matching Silero's 16 kHz ONNX wrapper.
 const CHUNK_SIZE: usize = 512;
 
 pub(crate) struct SileroVad16k<'a> {
@@ -24,7 +24,7 @@ pub(crate) struct SileroVad16k<'a> {
     lstm_b_hh: Tensor<'a>,
     final_conv_w: Tensor<'a>,
     final_conv_b: Tensor<'a>,
-    
+
     // States
     h: Tensor<'static>,
     c: Tensor<'static>,
@@ -40,37 +40,82 @@ impl<'a> SileroVad16k<'a> {
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
         let safe = SafeTensors::parse(bytes)
             .map_err(|e| SileroError::Message(format!("Failed to parse safetensors: {}", e)))?;
-        
+
         let view = safe.get("stft_conv.weight")?;
-        let stft_conv_w = Tensor { data: view.data, shape: view.shape };
+        let stft_conv_w = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("conv1.weight")?;
-        let conv1_w = Tensor { data: view.data, shape: view.shape };
+        let conv1_w = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("conv1.bias")?;
-        let conv1_b = Tensor { data: view.data, shape: view.shape };
+        let conv1_b = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("conv2.weight")?;
-        let conv2_w = Tensor { data: view.data, shape: view.shape };
+        let conv2_w = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("conv2.bias")?;
-        let conv2_b = Tensor { data: view.data, shape: view.shape };
+        let conv2_b = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("conv3.weight")?;
-        let conv3_w = Tensor { data: view.data, shape: view.shape };
+        let conv3_w = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("conv3.bias")?;
-        let conv3_b = Tensor { data: view.data, shape: view.shape };
+        let conv3_b = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("conv4.weight")?;
-        let conv4_w = Tensor { data: view.data, shape: view.shape };
+        let conv4_w = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("conv4.bias")?;
-        let conv4_b = Tensor { data: view.data, shape: view.shape };
+        let conv4_b = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("lstm_cell.weight_ih")?;
-        let lstm_w_ih = Tensor { data: view.data, shape: view.shape };
+        let lstm_w_ih = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("lstm_cell.weight_hh")?;
-        let lstm_w_hh = Tensor { data: view.data, shape: view.shape };
+        let lstm_w_hh = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("lstm_cell.bias_ih")?;
-        let lstm_b_ih = Tensor { data: view.data, shape: view.shape };
+        let lstm_b_ih = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("lstm_cell.bias_hh")?;
-        let lstm_b_hh = Tensor { data: view.data, shape: view.shape };
+        let lstm_b_hh = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("final_conv.weight")?;
-        let final_conv_w = Tensor { data: view.data, shape: view.shape };
+        let final_conv_w = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
         let view = safe.get("final_conv.bias")?;
-        let final_conv_b = Tensor { data: view.data, shape: view.shape };
+        let final_conv_b = Tensor {
+            data: view.data,
+            shape: view.shape,
+        };
 
         let h = Tensor::new(vec![0.0f32; 128], vec![1, 128]);
         let c = Tensor::new(vec![0.0f32; 128], vec![1, 128]);
@@ -116,7 +161,12 @@ impl<'a> SileroVad16k<'a> {
     }
 
     pub fn predict_chunk(&mut self, chunk: &[f32]) -> Result<f32> {
-        assert_eq!(chunk.len(), CHUNK_SIZE, "Silero VAD 16k requires exactly {} samples per chunk", CHUNK_SIZE);
+        assert_eq!(
+            chunk.len(),
+            CHUNK_SIZE,
+            "Silero VAD 16k requires exactly {} samples per chunk",
+            CHUNK_SIZE
+        );
 
         // 1. Prepend 64-sample context
         let mut x_input = [0.0f32; 576];
@@ -124,45 +174,84 @@ impl<'a> SileroVad16k<'a> {
         x_input[64..64 + CHUNK_SIZE].copy_from_slice(chunk);
 
         // 2. Reflect-pad right by 64
-        let x_tensor = Tensor::from_borrowed(&x_input[..64 + CHUNK_SIZE], vec![1, 1, 64 + CHUNK_SIZE]);
+        let x_tensor =
+            Tensor::from_borrowed(&x_input[..64 + CHUNK_SIZE], vec![1, 1, 64 + CHUNK_SIZE]);
         x_tensor.reflect_pad_1d_into(64, &mut self.buf_a[..128 + CHUNK_SIZE]);
 
         // 3. STFT conv (reads buf_a, writes buf_b)
         let out_seq_len = (CHUNK_SIZE - 128) / 128 + 1; // 4 for 512
-        let padded_tensor = Tensor::from_borrowed(&self.buf_a[..128 + CHUNK_SIZE], vec![1, 1, 128 + CHUNK_SIZE]);
-        padded_tensor.conv1d_into(&self.stft_conv_w, None, 128, 0, &mut self.buf_b[..258 * out_seq_len]);
+        let padded_tensor = Tensor::from_borrowed(
+            &self.buf_a[..128 + CHUNK_SIZE],
+            vec![1, 1, 128 + CHUNK_SIZE],
+        );
+        padded_tensor.conv1d_into(
+            &self.stft_conv_w,
+            None,
+            128,
+            0,
+            &mut self.buf_b[..258 * out_seq_len],
+        );
 
         // 4. Magnitude extraction (reads buf_b, writes buf_a)
-        let stft_tensor = Tensor::from_borrowed(&self.buf_b[..258 * out_seq_len], vec![1, 258, out_seq_len]);
+        let stft_tensor =
+            Tensor::from_borrowed(&self.buf_b[..258 * out_seq_len], vec![1, 258, out_seq_len]);
         stft_tensor.magnitude_into(129, &mut self.buf_a[..129 * out_seq_len]);
 
         // 5. Conv stack
         // Conv1 (reads buf_a, writes buf_b)
-        let mag_tensor = Tensor::from_borrowed(&self.buf_a[..129 * out_seq_len], vec![1, 129, out_seq_len]);
-        mag_tensor.conv1d_into(&self.conv1_w, Some(&self.conv1_b), 1, 1, &mut self.buf_b[..128 * out_seq_len]);
+        let mag_tensor =
+            Tensor::from_borrowed(&self.buf_a[..129 * out_seq_len], vec![1, 129, out_seq_len]);
+        mag_tensor.conv1d_into(
+            &self.conv1_w,
+            Some(&self.conv1_b),
+            1,
+            1,
+            &mut self.buf_b[..128 * out_seq_len],
+        );
         for val in &mut self.buf_b[..128 * out_seq_len] {
             *val = val.max(0.0);
         }
 
         // Conv2 (reads buf_b, writes buf_a)
         let out_seq_len2 = (out_seq_len - 1) / 2 + 1;
-        let conv1_relu_tensor = Tensor::from_borrowed(&self.buf_b[..128 * out_seq_len], vec![1, 128, out_seq_len]);
-        conv1_relu_tensor.conv1d_into(&self.conv2_w, Some(&self.conv2_b), 2, 1, &mut self.buf_a[..64 * out_seq_len2]);
+        let conv1_relu_tensor =
+            Tensor::from_borrowed(&self.buf_b[..128 * out_seq_len], vec![1, 128, out_seq_len]);
+        conv1_relu_tensor.conv1d_into(
+            &self.conv2_w,
+            Some(&self.conv2_b),
+            2,
+            1,
+            &mut self.buf_a[..64 * out_seq_len2],
+        );
         for val in &mut self.buf_a[..64 * out_seq_len2] {
             *val = val.max(0.0);
         }
 
         // Conv3 (reads buf_a, writes buf_b)
         let out_seq_len3 = (out_seq_len2 - 1) / 2 + 1;
-        let conv2_relu_tensor = Tensor::from_borrowed(&self.buf_a[..64 * out_seq_len2], vec![1, 64, out_seq_len2]);
-        conv2_relu_tensor.conv1d_into(&self.conv3_w, Some(&self.conv3_b), 2, 1, &mut self.buf_b[..64 * out_seq_len3]);
+        let conv2_relu_tensor =
+            Tensor::from_borrowed(&self.buf_a[..64 * out_seq_len2], vec![1, 64, out_seq_len2]);
+        conv2_relu_tensor.conv1d_into(
+            &self.conv3_w,
+            Some(&self.conv3_b),
+            2,
+            1,
+            &mut self.buf_b[..64 * out_seq_len3],
+        );
         for val in &mut self.buf_b[..64 * out_seq_len3] {
             *val = val.max(0.0);
         }
 
         // Conv4 (reads buf_b, writes buf_a)
-        let conv3_relu_tensor = Tensor::from_borrowed(&self.buf_b[..64 * out_seq_len3], vec![1, 64, out_seq_len3]);
-        conv3_relu_tensor.conv1d_into(&self.conv4_w, Some(&self.conv4_b), 1, 1, &mut self.buf_a[..128 * out_seq_len3]);
+        let conv3_relu_tensor =
+            Tensor::from_borrowed(&self.buf_b[..64 * out_seq_len3], vec![1, 64, out_seq_len3]);
+        conv3_relu_tensor.conv1d_into(
+            &self.conv4_w,
+            Some(&self.conv4_b),
+            1,
+            1,
+            &mut self.buf_a[..128 * out_seq_len3],
+        );
         for val in &mut self.buf_a[..128 * out_seq_len3] {
             *val = val.max(0.0);
         }
@@ -194,7 +283,13 @@ impl<'a> SileroVad16k<'a> {
             *val = val.max(0.0);
         }
         let relu_h_tensor = Tensor::from_borrowed(&self.buf_b[..128], vec![1, 128, 1]);
-        relu_h_tensor.conv1d_into(&self.final_conv_w, Some(&self.final_conv_b), 1, 0, &mut self.buf_a[..1]);
+        relu_h_tensor.conv1d_into(
+            &self.final_conv_w,
+            Some(&self.final_conv_b),
+            1,
+            0,
+            &mut self.buf_a[..1],
+        );
 
         let prob = 1.0 / (1.0 + (-self.buf_a[0]).exp());
         Ok(prob)
@@ -209,7 +304,7 @@ impl SileroVad16k<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Public API: VadConfig, SpeechTimestamp, Detector
+// Public API: RawDetector, VadConfig, SpeechTimestamp, Detector
 // ---------------------------------------------------------------------------
 
 /// Configuration for Silero VAD post-processing, mirroring the official Python helper params.
@@ -268,17 +363,75 @@ pub struct SpeechTimestamp {
     pub end: f32,
 }
 
-/// Streaming voice-activity detector backed by the 16 kHz Silero VAD model.
+/// Raw streaming voice-activity detector backed by the 16 kHz Silero VAD model.
+///
+/// This is the chunk-level model API. It does not apply [`VadConfig`]
+/// post-processing; callers own thresholding and endpointing policy.
+pub struct RawDetector {
+    model: SileroVad16k<'static>,
+}
+
+impl Default for RawDetector {
+    fn default() -> Self {
+        Self::new().expect("Failed to load embedded Silero VAD weights")
+    }
+}
+
+impl RawDetector {
+    /// Create a raw detector with embedded Silero VAD weights.
+    pub fn new() -> Result<Self> {
+        let model = SileroVad16k::load_embedded()?;
+        Ok(Self { model })
+    }
+
+    /// Run inference on a 512-sample chunk of 16 kHz mono `f32` PCM.
+    /// Returns a speech probability in `[0.0, 1.0]`.
+    pub fn predict_f32(&mut self, chunk: &[f32]) -> Result<f32> {
+        if chunk.len() != CHUNK_SIZE {
+            return Err(SileroError::Message(format!(
+                "Silero VAD 16k requires exactly {} samples per chunk, got {}",
+                CHUNK_SIZE,
+                chunk.len()
+            )));
+        }
+        self.model.predict_chunk(chunk)
+    }
+
+    /// Run inference on a 512-sample chunk of 16 kHz mono PCM16.
+    /// Returns a speech probability in `[0.0, 1.0]`.
+    pub fn predict_i16(&mut self, chunk: &[i16]) -> Result<f32> {
+        if chunk.len() != CHUNK_SIZE {
+            return Err(SileroError::Message(format!(
+                "Silero VAD 16k requires exactly {} samples per chunk, got {}",
+                CHUNK_SIZE,
+                chunk.len()
+            )));
+        }
+        let mut pcm = [0.0f32; CHUNK_SIZE];
+        for (dst, &sample) in pcm.iter_mut().zip(chunk) {
+            *dst = sample as f32 / 32768.0;
+        }
+        self.predict_f32(&pcm)
+    }
+
+    /// Reset all internal model state (LSTM hidden/cell, audio context).
+    /// Call this before processing a new, independent audio stream.
+    pub fn reset(&mut self) {
+        self.model.reset_states();
+    }
+}
+
+/// File-level voice-activity detector backed by the 16 kHz Silero VAD model.
 ///
 /// # Examples
 ///
 /// **Streaming (chunk-by-chunk):**
 /// ```rust,no_run
-/// use silero_vad_rust::Detector;
+/// use silero_vad_rust::RawDetector;
 ///
-/// let mut detector = Detector::default();
+/// let mut detector = RawDetector::default();
 /// let chunk = vec![0.0f32; 512]; // 512-sample, 16 kHz mono f32 PCM
-/// let score = detector.predict(&chunk);
+/// let score = detector.predict_f32(&chunk).unwrap();
 /// if score >= 0.5 { println!("Speech detected"); }
 /// detector.reset(); // reset between independent streams
 /// ```
@@ -295,7 +448,7 @@ pub struct SpeechTimestamp {
 /// }
 /// ```
 pub struct Detector {
-    model: SileroVad16k<'static>,
+    raw: RawDetector,
     config: VadConfig,
 }
 
@@ -313,20 +466,8 @@ impl Detector {
 
     /// Create a detector with a custom [`VadConfig`].
     pub fn with_config(config: VadConfig) -> Result<Self> {
-        let model = SileroVad16k::load_embedded()?;
-        Ok(Self { model, config })
-    }
-
-    /// Run inference on a 512-sample chunk of 16 kHz mono `f32` PCM.
-    /// Returns a speech probability in `[0.0, 1.0]`.
-    pub fn predict(&mut self, chunk: &[f32]) -> f32 {
-        self.model.predict_chunk(chunk).unwrap_or(0.0)
-    }
-
-    /// Reset all internal model state (LSTM hidden/cell, audio context).
-    /// Call this before processing a new, independent audio stream.
-    pub fn reset(&mut self) {
-        self.model.reset_states();
+        let raw = RawDetector::new()?;
+        Ok(Self { raw, config })
     }
 
     /// Read a 16 kHz mono WAV file and return detected speech segments.
@@ -343,17 +484,17 @@ impl Detector {
         path: P,
     ) -> Result<Vec<SpeechTimestamp>> {
         let audio = read_wav_f32(path.as_ref())?;
-        self.reset();
+        self.raw.reset();
 
         // Collect per-chunk probabilities
         let mut probs = Vec::with_capacity(audio.len() / CHUNK_SIZE + 1);
         for chunk in audio.chunks(CHUNK_SIZE) {
             if chunk.len() == CHUNK_SIZE {
-                probs.push(self.predict(chunk));
+                probs.push(self.raw.predict_f32(chunk)?);
             } else if !chunk.is_empty() {
                 let mut padded = [0.0f32; CHUNK_SIZE];
                 padded[..chunk.len()].copy_from_slice(chunk);
-                probs.push(self.predict(&padded));
+                probs.push(self.raw.predict_f32(&padded)?);
             }
         }
 
