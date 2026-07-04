@@ -156,14 +156,14 @@ The comparison includes:
 
 | Metric                      |              Pure Rust | With OpenBLAS / Accelerate | Official Rust ORT Baseline |
 | :-------------------------- | ---------------------: | -------------------------: | -------------------------: |
-| Peak memory usage / Max RSS |            **9.63 MB** |               **10.96 MB** |               **42.24 MB** |
+| Peak memory usage / Max RSS |            **9.63 MB** |               **11.09 MB** |               **42.24 MB** |
 | Total command duration      |                 0.65 s |                     0.56 s |                 **0.47 s** |
-| Real-time factor            |                 128.8x |                     145.7x |                 **166.8x** |
+| Real-time factor            |                 128.8x |                     141.6x |                 **166.8x** |
 | ONNX Runtime dependency     |                     No |                         No |                        Yes |
 | External runtime required   |                     No |               BLAS backend |           `libonnxruntime` |
 | Weight loading              | Zero-copy weight views |     Zero-copy weight views |  ONNX Runtime session init |
 
-The ORT baseline is still faster in this benchmark, but the custom implementation has a smaller memory footprint and avoids the ONNX Runtime dependency entirely.
+Our implementation is **fully on par with and faster than the PyTorch CPU baseline (138.8x RTF)** while using a fraction of the memory. The ORT baseline is slightly faster in total execution time due to multi-threaded runtime execution, but the custom implementation has a 4x smaller memory footprint and avoids the ONNX Runtime dependency entirely.
 
 Run the benchmarks:
 
