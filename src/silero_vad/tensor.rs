@@ -324,55 +324,81 @@ impl<'a> Tensor<'a> {
         let in_channels = self.shape[1];
         let seq_len = self.shape[2];
         let out_channels = weight.shape[0];
-        let _w_in_channels = weight.shape[1];
         let kernel_size = weight.shape[2];
         let out_seq_len = (seq_len + 2 * padding - kernel_size) / stride + 1;
         
+        let cols = in_channels * kernel_size;
+        assert!(cols <= 387, "cols ({}) exceeds pre-allocated static size 387", cols);
         assert_eq!(out.len(), batch * out_channels * out_seq_len);
 
-        for b in 0..batch {
-            for oc in 0..out_channels {
-                let w_oc_base = oc * in_channels * kernel_size;
-                for t in 0..out_seq_len {
-                    let mut sum = 0.0f32;
-                    for ic in 0..in_channels {
-                        let in_ic_base = b * (in_channels * seq_len) + ic * seq_len;
-                        let w_ic_base = w_oc_base + ic * kernel_size;
-                        
-                        let t_start = (t * stride) as isize - padding as isize;
+        let mut v = [0.0f32; 387];
 
-                        if t_start >= 0 && (t_start + kernel_size as isize) <= seq_len as isize {
-                            // FAST PATH: contiguous slice dot product (fully auto-vectorized by LLVM)
-                            let start_idx = in_ic_base + t_start as usize;
-                            let in_slice = &self.data[start_idx .. start_idx + kernel_size];
-                            let w_slice = &weight.data[w_ic_base .. w_ic_base + kernel_size];
-                            
-                            let mut channel_sum = 0.0f32;
-                            for k in 0..kernel_size {
-                                unsafe {
-                                    channel_sum += *in_slice.get_unchecked(k) * *w_slice.get_unchecked(k);
-                                }
+        for b in 0..batch {
+            for t in 0..out_seq_len {
+                // 1. Extract the input window at time step t across all input channels
+                let t_start = (t * stride) as isize - padding as isize;
+                let mut col_idx = 0;
+                for ic in 0..in_channels {
+                    let in_ic_base = b * (in_channels * seq_len) + ic * seq_len;
+                    for k in 0..kernel_size {
+                        let t_in = t_start + k as isize;
+                        if t_in >= 0 && t_in < seq_len as isize {
+                            unsafe {
+                                v[col_idx] = *self.data.get_unchecked(in_ic_base + t_in as usize);
                             }
-                            sum += channel_sum;
                         } else {
-                            // SLOW PATH: fallback boundary checks (padding)
-                            for k in 0..kernel_size {
-                                let t_in = t_start + k as isize;
-                                if t_in >= 0 && t_in < seq_len as isize {
-                                    unsafe {
-                                        let val = *self.data.get_unchecked(in_ic_base + t_in as usize);
-                                        let w_val = *weight.data.get_unchecked(w_ic_base + k);
-                                        sum += val * w_val;
-                                    }
-                                }
+                            v[col_idx] = 0.0;
+                        }
+                        col_idx += 1;
+                    }
+                }
+
+                // 2. Perform Matrix-Vector multiplication (GEMV): out_col = weight * v + bias
+                #[cfg(feature = "openblas")]
+                {
+                    // Copy bias value or initialize to 0.0
+                    for oc in 0..out_channels {
+                        let out_idx = b * (out_channels * out_seq_len) + oc * out_seq_len + t;
+                        out[out_idx] = match bias {
+                            Some(ref b_val) => b_val.data[oc],
+                            None => 0.0,
+                        };
+                    }
+                    unsafe {
+                        let out_ptr = out.as_mut_ptr().add(b * (out_channels * out_seq_len) + t);
+                        cblas_sgemv(
+                            CBLAS_ROW_MAJOR,
+                            CBLAS_NO_TRANS,
+                            out_channels as i32,
+                            cols as i32,
+                            1.0,
+                            weight.data.as_ptr(),
+                            cols as i32,
+                            v.as_ptr(),
+                            1,
+                            1.0,
+                            out_ptr,
+                            out_seq_len as i32,
+                        );
+                    }
+                }
+
+                #[cfg(not(feature = "openblas"))]
+                {
+                    for oc in 0..out_channels {
+                        let w_row = &weight.data[oc * cols .. (oc + 1) * cols];
+                        let mut sum = match bias {
+                            Some(ref b_val) => b_val.data[oc],
+                            None => 0.0,
+                        };
+                        for i in 0..cols {
+                            unsafe {
+                                sum += *w_row.get_unchecked(i) * *v.get_unchecked(i);
                             }
                         }
+                        let out_idx = b * (out_channels * out_seq_len) + oc * out_seq_len + t;
+                        out[out_idx] = sum;
                     }
-                    if let Some(ref b_val) = bias {
-                        sum += b_val.data[oc];
-                    }
-                    let out_idx = b * (out_channels * out_seq_len) + oc * out_seq_len + t;
-                    out[out_idx] = sum;
                 }
             }
         }

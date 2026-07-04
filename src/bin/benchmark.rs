@@ -1,20 +1,97 @@
 use silero_vad_rust::{load_silero_vad, read_audio};
 use std::time::Instant;
-use std::process::Command;
+
+#[cfg(feature = "benchmark_ort")]
+use std::mem::take;
+#[cfg(feature = "benchmark_ort")]
+use ort::session::Session;
+#[cfg(feature = "benchmark_ort")]
+use ort::value::Value;
+#[cfg(feature = "benchmark_ort")]
+use ndarray::{Array, Array1, ArrayD};
+
+#[cfg(feature = "benchmark_ort")]
+struct OrtSilero {
+    session: Session,
+    sample_rate: ndarray::ArrayBase<ndarray::OwnedRepr<i64>, ndarray::Dim<[usize; 1]>>,
+    state: ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<ndarray::IxDynImpl>>,
+    context: Array1<f32>,
+    context_size: usize,
+}
+
+#[cfg(feature = "benchmark_ort")]
+impl OrtSilero {
+    fn new(model_path: &str) -> Result<Self, ort::Error> {
+        let session = Session::builder()?.with_intra_threads(1)?.commit_from_file(model_path)?;
+        let state = ArrayD::<f32>::zeros([2, 1, 128].as_slice());
+        let context_size = 64;
+        let context = Array1::<f32>::zeros(context_size);
+        let sample_rate = Array::from_shape_vec([1], vec![16000i64]).unwrap();
+        Ok(Self {
+            session,
+            sample_rate,
+            state,
+            context,
+            context_size,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.state = ArrayD::<f32>::zeros([2, 1, 128].as_slice());
+        self.context = Array1::<f32>::zeros(self.context_size);
+    }
+
+    fn calc_level(&mut self, data: &[f32]) -> Result<f32, ort::Error> {
+        let mut input_with_context = Vec::with_capacity(self.context_size + data.len());
+        input_with_context.extend_from_slice(self.context.as_slice().unwrap());
+        input_with_context.extend_from_slice(data);
+
+        let frame = ndarray::Array2::<f32>::from_shape_vec([1, input_with_context.len()], input_with_context).unwrap();
+
+        let frame_value = Value::from_array(frame)?;
+        let state_value = Value::from_array(take(&mut self.state))?;
+        let sr_value = Value::from_array(self.sample_rate.clone())?;
+
+        let res = self.session.run([
+            (&frame_value).into(),
+            (&state_value).into(),
+            (&sr_value).into(),
+        ])?;
+
+        let (shape, state_data) = res["stateN"].try_extract_tensor::<f32>()?;
+        let shape_usize: Vec<usize> = shape.as_ref().iter().map(|&d| d as usize).collect();
+        self.state = ArrayD::from_shape_vec(shape_usize.as_slice(), state_data.to_vec()).unwrap();
+
+        if data.len() >= self.context_size {
+            self.context = Array1::from_vec(data[data.len() - self.context_size..].to_vec());
+        }
+
+        let prob = *res["output"]
+            .try_extract_tensor::<f32>()
+            .unwrap()
+            .1
+            .first()
+            .unwrap();
+        Ok(prob)
+    }
+}
 
 fn main() {
     println!("============================================================");
     println!("           SILERO VAD LATENCY & THROUGHPUT BENCHMARK         ");
     println!("============================================================");
 
-    // 1. Rust latency measurement
-    println!("Loading Rust custom Silero VAD model...");
-    let mut model = load_silero_vad().expect("Failed to load Rust model");
-
-    println!("Loading benchmark audio file (tests/data/test.wav)...");
-    let mut audio = read_audio("tests/data/test.wav", 16000).expect("Failed to load audio");
+    // 1. Rust profiling
+    println!("Profiling Custom Rust VAD...");
     
-    // Pad end of audio to a multiple of 512
+    let start_load = Instant::now();
+    let mut model = load_silero_vad().expect("Failed to load Rust model");
+    let rust_load_ms = start_load.elapsed().as_secs_f64() * 1000.0;
+
+    let start_decode = Instant::now();
+    let mut audio = read_audio("tests/data/test.wav", 16000).expect("Failed to load audio");
+    let rust_decode_ms = start_decode.elapsed().as_secs_f64() * 1000.0;
+    
     let remainder = audio.len() % 512;
     if remainder != 0 {
         audio.resize(audio.len() + 512 - remainder, 0.0);
@@ -23,117 +100,60 @@ fn main() {
     let audio_duration_s = audio.len() as f64 / 16000.0;
     let total_chunks = audio.len() / 512;
 
-    println!("Running Rust inference ({} chunks of 32 ms each)...", total_chunks);
-    let start_rust = Instant::now();
-    let mut dummy_sum = 0.0f32;
-    for chunk in audio.chunks_exact(512) {
-        let prob = model.predict_chunk(chunk).expect("Inference failed");
-        dummy_sum += prob;
+    let mut rust_runs = Vec::new();
+    for _ in 0..10 {
+        model.reset_states();
+        let start_inference = Instant::now();
+        for chunk in audio.chunks_exact(512) {
+            let _prob = model.predict_chunk(chunk).expect("Inference failed");
+        }
+        rust_runs.push(start_inference.elapsed().as_secs_f64() * 1000.0);
     }
-    let rust_elapsed = start_rust.elapsed();
-    let rust_elapsed_ms = rust_elapsed.as_secs_f64() * 1000.0;
-    let rust_per_chunk_us = (rust_elapsed_ms * 1000.0) / total_chunks as f64;
-    let rust_rtf = audio_duration_s / rust_elapsed.as_secs_f64();
+    let rust_inf_min = rust_runs.iter().copied().fold(f64::INFINITY, f64::min);
+    let rust_inf_avg = rust_runs.iter().sum::<f64>() / rust_runs.len() as f64;
 
-    println!("Rust Inference finished (checksum: {:.4}).", dummy_sum);
+    // 2. ORT Rust profiling
+    #[cfg(feature = "benchmark_ort")]
+    let (ort_load_ms, ort_inf_min, ort_inf_avg) = {
+        println!("Profiling Official Rust ORT Baseline...");
+        
+        let start_ort_load = Instant::now();
+        let mut ort_model = OrtSilero::new("/tmp/silero-vad-repo/src/silero_vad/data/silero_vad.onnx")
+            .expect("Failed to load ORT model");
+        let ort_load_ms = start_ort_load.elapsed().as_secs_f64() * 1000.0;
 
-    // 2. Python baseline measurement
-    println!("\nSpawning Python process to measure PyTorch/ONNX baseline latency...");
-    let python_cmd = r#"
-import torch
-import torch.nn as nn
-import numpy as np
-import wave
-import struct
-import time
-from safetensors.torch import load_file
+        let mut ort_runs = Vec::new();
+        for _ in 0..10 {
+            ort_model.reset();
+            let start_inference = Instant::now();
+            for chunk in audio.chunks_exact(512) {
+                let _prob = ort_model.calc_level(chunk).expect("ORT Inference failed");
+            }
+            ort_runs.push(start_inference.elapsed().as_secs_f64() * 1000.0);
+        }
+        let ort_inf_min = ort_runs.iter().copied().fold(f64::INFINITY, f64::min);
+        let ort_inf_avg = ort_runs.iter().sum::<f64>() / ort_runs.len() as f64;
+        (ort_load_ms, ort_inf_min, ort_inf_avg)
+    };
 
-class PyTorchSileroVAD(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.stft_conv = nn.Conv1d(1, 258, kernel_size=256, stride=128, padding=0, bias=False)
-        self.conv1 = nn.Conv1d(129, 128, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv1d(128, 64, kernel_size=3, stride=2, padding=1)
-        self.conv3 = nn.Conv1d(64, 64, kernel_size=3, stride=2, padding=1)
-        self.conv4 = nn.Conv1d(64, 128, kernel_size=3, stride=1, padding=1)
-        self.lstm_cell = nn.LSTMCell(128, 128)
-        self.final_conv = nn.Conv1d(128, 1, 1)
-
-    def forward(self, x, state=None):
-        x = torch.nn.functional.pad(x.unsqueeze(1), (0, 64), mode='reflect')
-        x = self.stft_conv(x)
-        x = torch.sqrt(x[:, :129, :]**2 + x[:, 129:, :]**2)
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = torch.relu(self.conv3(x))
-        x = torch.relu(self.conv4(x)).squeeze(-1)
-        if state is None:
-            h = torch.zeros(x.shape[0], 128)
-            c = torch.zeros(x.shape[0], 128)
-        else:
-            h, c = state
-        h, c = self.lstm_cell(x, (h, c))
-        state = (h, c)
-        x = h.unsqueeze(-1)
-        x = torch.relu(x)
-        x = torch.sigmoid(self.final_conv(x))
-        x = x.squeeze(1).mean(dim=1, keepdim=True)
-        return x, state
-
-weights = load_file('/tmp/silero-vad-repo/src/silero_vad/data/silero_vad_16k.safetensors')
-model = PyTorchSileroVAD()
-model.load_state_dict(weights)
-model.eval()
-
-with wave.open('/Users/tony/Documents/keyboard/silero_vad_rust/tests/data/test.wav', 'rb') as w:
-    frames = w.readframes(w.getnframes())
-    samples = struct.unpack(f'<{w.getnframes()}h', frames)
-    audio = torch.tensor(samples, dtype=torch.float32) / 32768.0
-
-wav = audio.unsqueeze(0)
-num_samples = 512
-context_size = 64
-padded_wav = torch.nn.functional.pad(wav, (context_size, 0))
-
-state = None
-start_time = time.perf_counter()
-for i in range(context_size, padded_wav.shape[1], num_samples):
-    chunk = padded_wav[:, i-context_size:i+num_samples]
-    if chunk.shape[1] < context_size + num_samples:
-        chunk = torch.nn.functional.pad(chunk, (0, context_size + num_samples - chunk.shape[1]))
-    out, state = model(chunk, state)
-    val = out.item()
-elapsed = time.perf_counter() - start_time
-print(f"RESULT_MS:{elapsed * 1000:.3f}")
-"#;
-
-    let output = Command::new("/opt/homebrew/Caskroom/miniconda/base/envs/asr/bin/python")
-        .arg("-c")
-        .arg(python_cmd)
-        .output()
-        .expect("Failed to execute python baseline command");
-
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    let py_ms = stdout_str
-        .lines()
-        .find(|l| l.starts_with("RESULT_MS:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.parse::<f64>().ok())
-        .expect("Failed to parse python benchmark latency output");
-
-    let py_per_chunk_us = (py_ms * 1000.0) / total_chunks as f64;
-    let py_rtf = audio_duration_s / (py_ms / 1000.0);
+    #[cfg(not(feature = "benchmark_ort"))]
+    let (ort_load_ms, ort_inf_min, ort_inf_avg) = (0.0, 0.0, 0.0);
 
     // 3. Output results comparison
     println!("\n============================================================");
-    println!("                      BENCHMARK COMPARISON                  ");
+    println!("                DETAILED PROFILING COMPARISON                ");
     println!("============================================================");
-    println!("Metric                 | Custom Rust VAD | PyTorch Baseline");
-    println!("-----------------------|-----------------|------------------");
-    println!("Audio Duration         | {:<15.3}s | {:<15.3}s", audio_duration_s, audio_duration_s);
-    println!("Total Execution Time   | {:<15.3}ms| {:<15.3}ms", rust_elapsed_ms, py_ms);
-    println!("Average Chunk Latency  | {:<15.3}µs| {:<15.3}µs", rust_per_chunk_us, py_per_chunk_us);
-    println!("Real-time Factor (RTF) | {:<15.2}x | {:<15.2}x", rust_rtf, py_rtf);
-    println!("Speedup Factor         | {:<15.2}x | 1.00x (Baseline)", rust_rtf / py_rtf);
+    println!("Phase / Metric          | Custom Rust VAD | Official ORT Rust");
+    println!("------------------------|-----------------|------------------");
+    println!("Model Load & Init       | {:<15.3}ms| {:<15.3}ms", rust_load_ms, ort_load_ms);
+    println!("Audio Load & Decode     | {:<15.3}ms| {:<15.3}ms", rust_decode_ms, rust_decode_ms);
+    println!("Min Inference (60s loop)| {:<15.3}ms| {:<15.3}ms", rust_inf_min, ort_inf_min);
+    println!("Avg Inference (60s loop)| {:<15.3}ms| {:<15.3}ms", rust_inf_avg, ort_inf_avg);
+    println!("Avg Chunk Latency       | {:<15.3}µs| {:<15.3}µs", (rust_inf_avg * 1000.0) / total_chunks as f64, (ort_inf_avg * 1000.0) / total_chunks as f64);
+    println!("Avg Real-time Factor    | {:<15.2}x | {:<15.2}x", audio_duration_s / (rust_inf_avg / 1000.0), audio_duration_s / (ort_inf_avg / 1000.0));
+    #[cfg(feature = "benchmark_ort")]
+    println!("Speedup Factor          | {:<15.2}x | 1.00x (Baseline)", ort_inf_avg / rust_inf_avg);
+    #[cfg(not(feature = "benchmark_ort"))]
+    println!("Speedup Factor          | [Run with --features benchmark_ort to see comparative metrics]");
     println!("============================================================");
 }
