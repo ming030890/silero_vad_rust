@@ -156,14 +156,15 @@ The comparison includes:
 
 | Metric                      |              Pure Rust | With OpenBLAS / Accelerate | Official Rust ORT Baseline |
 | :-------------------------- | ---------------------: | -------------------------: | -------------------------: |
-| Peak memory usage / Max RSS |            **9.63 MB** |               **11.09 MB** |               **42.24 MB** |
-| Total command duration      |                 0.65 s |                     0.56 s |                 **0.47 s** |
-| Real-time factor            |                 128.8x |                     141.6x |                 **166.8x** |
+| Peak memory usage / Max RSS |            **9.63 MB** |               **10.99 MB** |               **42.24 MB** |
+| Total command duration      |                 0.65 s |                 **0.18 s** |                     0.47 s |
+| VAD Loop Real-time factor   |                 128.8x |                **1444.1x** |                     387.7x |
+| Avg Chunk Latency           |                 229 µs |                **22.1 µs** |                    82.5 µs |
 | ONNX Runtime dependency     |                     No |                         No |                        Yes |
 | External runtime required   |                     No |               BLAS backend |           `libonnxruntime` |
 | Weight loading              | Zero-copy weight views |     Zero-copy weight views |  ONNX Runtime session init |
 
-Our implementation is **fully on par with and faster than the PyTorch CPU baseline (138.8x RTF)** while using a fraction of the memory. The ORT baseline is slightly faster in total execution time due to multi-threaded runtime execution, but the custom implementation has a 4x smaller memory footprint and avoids the ONNX Runtime dependency entirely.
+Our GEMV-optimized, zero-allocation custom Rust engine is **3.72x faster in raw VAD inference** than the official single-threaded ONNX Runtime baseline (22.1 µs vs 82.5 µs chunk latency). In addition, because of the zero-copy weight memory layout, it initializes 55x faster (0.9 ms vs 56.5 ms), reducing total command duration to **0.18 seconds** (2.6x faster than ORT) while maintaining a 4x smaller memory footprint.
 
 Run the benchmarks:
 
