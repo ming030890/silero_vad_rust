@@ -1,4 +1,4 @@
-use silero_vad_rust::{load_silero_vad, read_audio};
+use silero_vad_rust::Detector;
 use std::time::Instant;
 
 #[cfg(feature = "benchmark_ort")]
@@ -76,6 +76,23 @@ impl OrtSilero {
     }
 }
 
+fn read_wav_f32(path: &str) -> Vec<f32> {
+    let mut reader = hound::WavReader::open(path).expect("Failed to open WAV file");
+    let spec = reader.spec();
+    assert_eq!(spec.sample_rate, 16000, "Expected 16 kHz WAV, got {} Hz", spec.sample_rate);
+    assert_eq!(spec.channels, 1, "Expected mono WAV, got {} channels", spec.channels);
+
+    match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max_val = (1u32 << (spec.bits_per_sample - 1)) as f32;
+            reader.samples::<i32>().map(|s| s.unwrap() as f32 / max_val).collect()
+        }
+        hound::SampleFormat::Float => {
+            reader.samples::<f32>().map(|s| s.unwrap()).collect()
+        }
+    }
+}
+
 fn main() {
     println!("============================================================");
     println!("           SILERO VAD LATENCY & THROUGHPUT BENCHMARK         ");
@@ -85,11 +102,11 @@ fn main() {
     println!("Profiling Custom Rust VAD...");
     
     let start_load = Instant::now();
-    let mut model = load_silero_vad().expect("Failed to load Rust model");
+    let mut detector = Detector::default();
     let rust_load_ms = start_load.elapsed().as_secs_f64() * 1000.0;
 
     let start_decode = Instant::now();
-    let mut audio = read_audio("tests/data/test.wav", 16000).expect("Failed to load audio");
+    let mut audio = read_wav_f32("tests/data/test.wav");
     let rust_decode_ms = start_decode.elapsed().as_secs_f64() * 1000.0;
     
     let remainder = audio.len() % 512;
@@ -102,10 +119,10 @@ fn main() {
 
     let mut rust_runs = Vec::new();
     for _ in 0..10 {
-        model.reset_states();
+        detector.reset();
         let start_inference = Instant::now();
         for chunk in audio.chunks_exact(512) {
-            let _prob = model.predict_chunk(chunk).expect("Inference failed");
+            let _prob = detector.predict(chunk);
         }
         rust_runs.push(start_inference.elapsed().as_secs_f64() * 1000.0);
     }

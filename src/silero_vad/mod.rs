@@ -1,6 +1,6 @@
 pub mod data;
 pub mod model;
-pub mod utils_vad;
+
 pub mod safetensors;
 pub mod tensor;
 
