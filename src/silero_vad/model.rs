@@ -23,6 +23,11 @@ pub struct SileroVad16k<'a> {
     h: Tensor<'static>,
     c: Tensor<'static>,
     context: Vec<f32>,
+
+    // Pre-allocated ping-pong memory buffers
+    buf_a: Vec<f32>,
+    buf_b: Vec<f32>,
+    buf_gates: Vec<f32>,
 }
 
 impl<'a> SileroVad16k<'a> {
@@ -65,6 +70,11 @@ impl<'a> SileroVad16k<'a> {
         let c = Tensor::new(vec![0.0f32; 128], vec![1, 128]);
         let context = vec![0.0f32; 64];
 
+        // Allocating reusable buffers once at load time
+        let buf_a = vec![0.0f32; 1032];
+        let buf_b = vec![0.0f32; 1032];
+        let buf_gates = vec![0.0f32; 512];
+
         Ok(SileroVad16k {
             stft_conv_w,
             conv1_w,
@@ -84,14 +94,19 @@ impl<'a> SileroVad16k<'a> {
             h,
             c,
             context,
+            buf_a,
+            buf_b,
+            buf_gates,
         })
     }
-
 
     pub fn reset_states(&mut self) {
         self.h = Tensor::new(vec![0.0f32; 128], vec![1, 128]);
         self.c = Tensor::new(vec![0.0f32; 128], vec![1, 128]);
         self.context = vec![0.0f32; 64];
+        self.buf_a.fill(0.0);
+        self.buf_b.fill(0.0);
+        self.buf_gates.fill(0.0);
     }
 
     pub fn predict_chunk(&mut self, chunk: &[f32]) -> Result<f32> {
@@ -102,53 +117,96 @@ impl<'a> SileroVad16k<'a> {
             )));
         }
 
-        // Construct 576-sample input: context (64) + chunk (512)
-        let mut x_input = Vec::with_capacity(576);
-        x_input.extend_from_slice(&self.context);
-        x_input.extend_from_slice(chunk);
+        // 1. Stack-allocated input sequence of 576 samples
+        let mut x_input = [0.0f32; 576];
+        x_input[..64].copy_from_slice(&self.context);
+        x_input[64..].copy_from_slice(chunk);
 
-        // Pad right with reflect padding by 64 (results in 640 samples)
-        let x_tensor = Tensor::new(x_input, vec![1, 1, 576]);
-        let padded = x_tensor.reflect_pad_1d(64); // [1, 1, 640]
+        // 2. Pad right with reflect padding by 64 (results in 640 samples in buf_a)
+        let x_tensor = Tensor::from_borrowed(&x_input, vec![1, 1, 576]);
+        x_tensor.reflect_pad_1d_into(64, &mut self.buf_a[..640]);
 
-        // 1. stft_conv
-        let x = padded.conv1d(&self.stft_conv_w, None, 128, 0); // [1, 258, 4]
+        // 3. stft_conv (reads buf_a[..640], writes buf_b[..1032])
+        let padded_tensor = Tensor::from_borrowed(&self.buf_a[..640], vec![1, 1, 640]);
+        padded_tensor.conv1d_into(&self.stft_conv_w, None, 128, 0, &mut self.buf_b[..1032]);
 
-        // 2. Magnitude extraction
-        let x = x.magnitude(129); // [1, 129, 4]
+        // 4. Magnitude extraction (reads buf_b[..1032], writes buf_a[..516])
+        let stft_tensor = Tensor::from_borrowed(&self.buf_b[..1032], vec![1, 258, 4]);
+        stft_tensor.magnitude_into(129, &mut self.buf_a[..516]);
 
-        // 3. Conv stack
-        let x = x.conv1d(&self.conv1_w, Some(&self.conv1_b), 1, 1).relu(); // [1, 128, 4]
-        let x = x.conv1d(&self.conv2_w, Some(&self.conv2_b), 2, 1).relu(); // [1, 64, 2]
-        let x = x.conv1d(&self.conv3_w, Some(&self.conv3_b), 2, 1).relu(); // [1, 64, 1]
-        let x = x.conv1d(&self.conv4_w, Some(&self.conv4_b), 1, 1).relu(); // [1, 128, 1]
+        // 5. Conv stack
+        // Conv1 (reads buf_a[..516], writes buf_b[..512])
+        let mag_tensor = Tensor::from_borrowed(&self.buf_a[..516], vec![1, 129, 4]);
+        mag_tensor.conv1d_into(&self.conv1_w, Some(&self.conv1_b), 1, 1, &mut self.buf_b[..512]);
+        // In-place ReLU on buf_b
+        for val in &mut self.buf_b[..512] {
+            *val = val.max(0.0);
+        }
 
-        // Squeeze last dimension to [1, 128]
-        let x_squeezed = Tensor::new(x.data.into_owned(), vec![1, 128]);
+        // Conv2 (reads buf_b[..512], writes buf_a[..128])
+        let conv1_relu_tensor = Tensor::from_borrowed(&self.buf_b[..512], vec![1, 128, 4]);
+        conv1_relu_tensor.conv1d_into(&self.conv2_w, Some(&self.conv2_b), 2, 1, &mut self.buf_a[..128]);
+        // In-place ReLU on buf_a
+        for val in &mut self.buf_a[..128] {
+            *val = val.max(0.0);
+        }
 
-        // 4. LSTM Cell update
-        let (h_next, c_next) = x_squeezed.lstm_cell(
+        // Conv3 (reads buf_a[..128], writes buf_b[..64])
+        let conv2_relu_tensor = Tensor::from_borrowed(&self.buf_a[..128], vec![1, 64, 2]);
+        conv2_relu_tensor.conv1d_into(&self.conv3_w, Some(&self.conv3_b), 2, 1, &mut self.buf_b[..64]);
+        // In-place ReLU on buf_b
+        for val in &mut self.buf_b[..64] {
+            *val = val.max(0.0);
+        }
+
+        // Conv4 (reads buf_b[..64], writes buf_a[..128])
+        let conv3_relu_tensor = Tensor::from_borrowed(&self.buf_b[..64], vec![1, 64, 1]);
+        conv3_relu_tensor.conv1d_into(&self.conv4_w, Some(&self.conv4_b), 1, 1, &mut self.buf_a[..128]);
+        // In-place ReLU on buf_a
+        for val in &mut self.buf_a[..128] {
+            *val = val.max(0.0);
+        }
+
+        // 6. LSTM Cell (reads input from buf_a[..128])
+        let lstm_in_tensor = Tensor::from_borrowed(&self.buf_a[..128], vec![1, 128]);
+        
+        let mut h_next_buf = [0.0f32; 128];
+        let mut c_next_buf = [0.0f32; 128];
+
+        lstm_in_tensor.lstm_cell_into(
             &self.lstm_w_ih,
             &self.lstm_w_hh,
             &self.lstm_b_ih,
             &self.lstm_b_hh,
             &self.h,
             &self.c,
+            &mut self.buf_gates,
+            &mut h_next_buf,
+            &mut c_next_buf,
         );
-        self.h = h_next;
-        self.c = c_next;
 
-        // 5. Update context with the last 64 samples of the current chunk
+        // Copy outputs back to self.h and self.c without allocating
+        self.h.data.to_mut().copy_from_slice(&h_next_buf);
+        self.c.data.to_mut().copy_from_slice(&c_next_buf);
+
+        // 7. Update context with the last 64 samples of the current chunk
         self.context.copy_from_slice(&chunk[448..512]);
 
-        // 6. Decoder
-        let h_unsqueezed = Tensor::new(self.h.data.to_vec(), vec![1, 128, 1]);
-        let decoded = h_unsqueezed.relu();
-        let prob_tensor = decoded.conv1d(&self.final_conv_w, Some(&self.final_conv_b), 1, 0).sigmoid(); // [1, 1, 1]
+        // 8. Decoder
+        // h has shape [1, 128, 1]. Relu it into buf_b[..128]
+        self.buf_b[..128].copy_from_slice(&self.h.data);
+        for val in &mut self.buf_b[..128] {
+            *val = val.max(0.0);
+        }
 
-        // prob_tensor is [1, 1, 1], mean over sequence is just the value
-        let prob = prob_tensor.data[0];
+        // Conv1d from buf_b[..128] into buf_a[..1]
+        let relu_h_tensor = Tensor::from_borrowed(&self.buf_b[..128], vec![1, 128, 1]);
+        relu_h_tensor.conv1d_into(&self.final_conv_w, Some(&self.final_conv_b), 1, 0, &mut self.buf_a[..1]);
 
+        // In-place sigmoid on buf_a[..1]
+        self.buf_a[0] = 1.0 / (1.0 + (-self.buf_a[0]).exp());
+
+        let prob = self.buf_a[0];
         Ok(prob)
     }
 }
