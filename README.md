@@ -37,6 +37,38 @@ The project is intentionally narrow in scope: it supports the 16 kHz Silero VAD 
 
   * Integration tests compare the Rust implementation against the official PyTorch reference output.
 
+## Benchmarks
+
+Benchmarks were run on macOS with Apple Silicon using the same 60-second WAV file.
+
+The comparison includes:
+
+1. this custom Rust implementation
+2. this implementation with optional BLAS acceleration
+3. the official Silero `rust-example` baseline using the ONNX Runtime `ort` crate
+
+| Metric                      |              Pure Rust | With OpenBLAS / Accelerate | Official Rust ORT Baseline |
+| :-------------------------- | ---------------------: | -------------------------: | -------------------------: |
+| Peak memory usage / Max RSS |            **9.63 MB** |               **10.99 MB** |               **42.24 MB** |
+| Total command duration      |                 0.65 s |                 **0.18 s** |                     0.47 s |
+| VAD Loop Real-time factor   |                 128.8x |                **1444.1x** |                     387.7x |
+| Avg Chunk Latency           |                 229 µs |                **22.1 µs** |                    82.5 µs |
+| ONNX Runtime dependency     |                     No |                         No |                        Yes |
+| External runtime required   |                     No |               BLAS backend |           `libonnxruntime` |
+| Weight loading              | Zero-copy weight views |     Zero-copy weight views |  ONNX Runtime session init |
+
+Our GEMV-optimized, zero-allocation custom Rust engine is **3.72x faster in raw VAD inference** than the official single-threaded ONNX Runtime baseline (22.1 µs vs 82.5 µs chunk latency). In addition, because of the zero-copy weight memory layout, it initializes 55x faster (0.9 ms vs 56.5 ms), reducing total command duration to **0.18 seconds** (2.6x faster than ORT) while maintaining a 4x smaller memory footprint.
+
+Run the benchmarks:
+
+```bash
+# Pure Rust implementation
+cargo run --release --bin benchmark
+
+# With BLAS acceleration
+cargo run --release --bin benchmark --features openblas
+```
+
 ## Scope
 
 This is not a general ONNX runtime or a general neural network framework.
@@ -144,37 +176,6 @@ chunk=0002 prob=0.7321 speech=true
 chunk=0003 prob=0.8914 speech=true
 ```
 
-## Benchmarks
-
-Benchmarks were run on macOS with Apple Silicon using the same 60-second WAV file.
-
-The comparison includes:
-
-1. this custom Rust implementation
-2. this implementation with optional BLAS acceleration
-3. the official Silero `rust-example` baseline using the ONNX Runtime `ort` crate
-
-| Metric                      |              Pure Rust | With OpenBLAS / Accelerate | Official Rust ORT Baseline |
-| :-------------------------- | ---------------------: | -------------------------: | -------------------------: |
-| Peak memory usage / Max RSS |            **9.63 MB** |               **10.99 MB** |               **42.24 MB** |
-| Total command duration      |                 0.65 s |                 **0.18 s** |                     0.47 s |
-| VAD Loop Real-time factor   |                 128.8x |                **1444.1x** |                     387.7x |
-| Avg Chunk Latency           |                 229 µs |                **22.1 µs** |                    82.5 µs |
-| ONNX Runtime dependency     |                     No |                         No |                        Yes |
-| External runtime required   |                     No |               BLAS backend |           `libonnxruntime` |
-| Weight loading              | Zero-copy weight views |     Zero-copy weight views |  ONNX Runtime session init |
-
-Our GEMV-optimized, zero-allocation custom Rust engine is **3.72x faster in raw VAD inference** than the official single-threaded ONNX Runtime baseline (22.1 µs vs 82.5 µs chunk latency). In addition, because of the zero-copy weight memory layout, it initializes 55x faster (0.9 ms vs 56.5 ms), reducing total command duration to **0.18 seconds** (2.6x faster than ORT) while maintaining a 4x smaller memory footprint.
-
-Run the benchmarks:
-
-```bash
-# Pure Rust implementation
-cargo run --release --bin benchmark
-
-# With BLAS acceleration
-cargo run --release --bin benchmark --features openblas
-```
 
 ## Testing
 
