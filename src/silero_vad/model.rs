@@ -70,7 +70,7 @@ impl<'a> SileroVad16k<'a> {
         let c = Tensor::new(vec![0.0f32; 128], vec![1, 128]);
         let context = vec![0.0f32; 64];
 
-        // Allocating reusable buffers once at load time
+        // Allocating reusable buffers once at load time (sized for max chunk of 512)
         let buf_a = vec![0.0f32; 1032];
         let buf_b = vec![0.0f32; 1032];
         let buf_gates = vec![0.0f32; 512];
@@ -110,64 +110,68 @@ impl<'a> SileroVad16k<'a> {
     }
 
     pub fn predict_chunk(&mut self, chunk: &[f32]) -> Result<f32> {
-        if chunk.len() != 512 {
+        let chunk_size = chunk.len();
+        if chunk_size != 256 && chunk_size != 512 {
             return Err(SileroError::Message(format!(
-                "predict_chunk expects exactly 512 samples, got {}",
-                chunk.len()
+                "predict_chunk expects 256 or 512 samples, got {}",
+                chunk_size
             )));
         }
 
-        // 1. Stack-allocated input sequence of 576 samples
+        // 1. Stack-allocated input sequence of 576 samples max
         let mut x_input = [0.0f32; 576];
         x_input[..64].copy_from_slice(&self.context);
-        x_input[64..].copy_from_slice(chunk);
+        x_input[64..64 + chunk_size].copy_from_slice(chunk);
 
-        // 2. Pad right with reflect padding by 64 (results in 640 samples in buf_a)
-        let x_tensor = Tensor::from_borrowed(&x_input, vec![1, 1, 576]);
-        x_tensor.reflect_pad_1d_into(64, &mut self.buf_a[..640]);
+        // 2. Pad right with reflect padding by 64
+        let x_tensor = Tensor::from_borrowed(&x_input[..64 + chunk_size], vec![1, 1, 64 + chunk_size]);
+        x_tensor.reflect_pad_1d_into(64, &mut self.buf_a[..128 + chunk_size]);
 
-        // 3. stft_conv (reads buf_a[..640], writes buf_b[..1032])
-        let padded_tensor = Tensor::from_borrowed(&self.buf_a[..640], vec![1, 1, 640]);
-        padded_tensor.conv1d_into(&self.stft_conv_w, None, 128, 0, &mut self.buf_b[..1032]);
+        // 3. stft_conv (reads buf_a, writes buf_b)
+        let out_seq_len = (chunk_size - 128) / 128 + 1; // 2 for C=256, 4 for C=512
+        let padded_tensor = Tensor::from_borrowed(&self.buf_a[..128 + chunk_size], vec![1, 1, 128 + chunk_size]);
+        padded_tensor.conv1d_into(&self.stft_conv_w, None, 128, 0, &mut self.buf_b[..258 * out_seq_len]);
 
-        // 4. Magnitude extraction (reads buf_b[..1032], writes buf_a[..516])
-        let stft_tensor = Tensor::from_borrowed(&self.buf_b[..1032], vec![1, 258, 4]);
-        stft_tensor.magnitude_into(129, &mut self.buf_a[..516]);
+        // 4. Magnitude extraction (reads buf_b, writes buf_a)
+        let stft_tensor = Tensor::from_borrowed(&self.buf_b[..258 * out_seq_len], vec![1, 258, out_seq_len]);
+        stft_tensor.magnitude_into(129, &mut self.buf_a[..129 * out_seq_len]);
 
         // 5. Conv stack
-        // Conv1 (reads buf_a[..516], writes buf_b[..512])
-        let mag_tensor = Tensor::from_borrowed(&self.buf_a[..516], vec![1, 129, 4]);
-        mag_tensor.conv1d_into(&self.conv1_w, Some(&self.conv1_b), 1, 1, &mut self.buf_b[..512]);
+        // Conv1 (reads buf_a, writes buf_b)
+        let mag_tensor = Tensor::from_borrowed(&self.buf_a[..129 * out_seq_len], vec![1, 129, out_seq_len]);
+        mag_tensor.conv1d_into(&self.conv1_w, Some(&self.conv1_b), 1, 1, &mut self.buf_b[..128 * out_seq_len]);
         // In-place ReLU on buf_b
-        for val in &mut self.buf_b[..512] {
+        for val in &mut self.buf_b[..128 * out_seq_len] {
             *val = val.max(0.0);
         }
 
-        // Conv2 (reads buf_b[..512], writes buf_a[..128])
-        let conv1_relu_tensor = Tensor::from_borrowed(&self.buf_b[..512], vec![1, 128, 4]);
-        conv1_relu_tensor.conv1d_into(&self.conv2_w, Some(&self.conv2_b), 2, 1, &mut self.buf_a[..128]);
+        // Conv2 (reads buf_b, writes buf_a)
+        let out_seq_len2 = (out_seq_len - 1) / 2 + 1; // 1 for C=256, 2 for C=512
+        let conv1_relu_tensor = Tensor::from_borrowed(&self.buf_b[..128 * out_seq_len], vec![1, 128, out_seq_len]);
+        conv1_relu_tensor.conv1d_into(&self.conv2_w, Some(&self.conv2_b), 2, 1, &mut self.buf_a[..64 * out_seq_len2]);
         // In-place ReLU on buf_a
-        for val in &mut self.buf_a[..128] {
+        for val in &mut self.buf_a[..64 * out_seq_len2] {
             *val = val.max(0.0);
         }
 
-        // Conv3 (reads buf_a[..128], writes buf_b[..64])
-        let conv2_relu_tensor = Tensor::from_borrowed(&self.buf_a[..128], vec![1, 64, 2]);
-        conv2_relu_tensor.conv1d_into(&self.conv3_w, Some(&self.conv3_b), 2, 1, &mut self.buf_b[..64]);
+        // Conv3 (reads buf_a, writes buf_b)
+        let out_seq_len3 = (out_seq_len2 - 1) / 2 + 1; // 1 for C=256, 1 for C=512
+        let conv2_relu_tensor = Tensor::from_borrowed(&self.buf_a[..64 * out_seq_len2], vec![1, 64, out_seq_len2]);
+        conv2_relu_tensor.conv1d_into(&self.conv3_w, Some(&self.conv3_b), 2, 1, &mut self.buf_b[..64 * out_seq_len3]);
         // In-place ReLU on buf_b
-        for val in &mut self.buf_b[..64] {
+        for val in &mut self.buf_b[..64 * out_seq_len3] {
             *val = val.max(0.0);
         }
 
-        // Conv4 (reads buf_b[..64], writes buf_a[..128])
-        let conv3_relu_tensor = Tensor::from_borrowed(&self.buf_b[..64], vec![1, 64, 1]);
-        conv3_relu_tensor.conv1d_into(&self.conv4_w, Some(&self.conv4_b), 1, 1, &mut self.buf_a[..128]);
+        // Conv4 (reads buf_b, writes buf_a)
+        let conv3_relu_tensor = Tensor::from_borrowed(&self.buf_b[..64 * out_seq_len3], vec![1, 64, out_seq_len3]);
+        conv3_relu_tensor.conv1d_into(&self.conv4_w, Some(&self.conv4_b), 1, 1, &mut self.buf_a[..128 * out_seq_len3]);
         // In-place ReLU on buf_a
-        for val in &mut self.buf_a[..128] {
+        for val in &mut self.buf_a[..128 * out_seq_len3] {
             *val = val.max(0.0);
         }
 
-        // 6. LSTM Cell (reads input from buf_a[..128])
+        // 6. LSTM Cell (reads input from buf_a)
         let lstm_in_tensor = Tensor::from_borrowed(&self.buf_a[..128], vec![1, 128]);
         
         let mut h_next_buf = [0.0f32; 128];
@@ -190,20 +194,20 @@ impl<'a> SileroVad16k<'a> {
         self.c.data.to_mut().copy_from_slice(&c_next_buf);
 
         // 7. Update context with the last 64 samples of the current chunk
-        self.context.copy_from_slice(&chunk[448..512]);
+        self.context.copy_from_slice(&chunk[chunk_size - 64..]);
 
         // 8. Decoder
-        // h has shape [1, 128, 1]. Relu it into buf_b[..128]
+        // h has shape [1, 128, 1]. Relu it into buf_b
         self.buf_b[..128].copy_from_slice(&self.h.data);
         for val in &mut self.buf_b[..128] {
             *val = val.max(0.0);
         }
 
-        // Conv1d from buf_b[..128] into buf_a[..1]
+        // Conv1d from buf_b into buf_a
         let relu_h_tensor = Tensor::from_borrowed(&self.buf_b[..128], vec![1, 128, 1]);
         relu_h_tensor.conv1d_into(&self.final_conv_w, Some(&self.final_conv_b), 1, 0, &mut self.buf_a[..1]);
 
-        // In-place sigmoid on buf_a[..1]
+        // In-place sigmoid on buf_a
         self.buf_a[0] = 1.0 / (1.0 + (-self.buf_a[0]).exp());
 
         let prob = self.buf_a[0];
@@ -220,4 +224,47 @@ impl SileroVad16k<'static> {
 
 pub fn load_silero_vad() -> Result<SileroVad16k<'static>> {
     SileroVad16k::load_embedded()
+}
+
+// -----------------------------------------------------------------------------
+// Drop-in Replacement API wrapper matching `earshot::Detector`
+// -----------------------------------------------------------------------------
+
+pub struct Detector {
+    model: SileroVad16k<'static>,
+    f32_buf: Vec<f32>,
+}
+
+impl Default for Detector {
+    fn default() -> Self {
+        Self::new().expect("Failed to load embedded Silero VAD weights")
+    }
+}
+
+impl Detector {
+    pub fn new() -> Result<Self> {
+        let model = load_silero_vad()?;
+        Ok(Self {
+            model,
+            f32_buf: vec![0.0f32; 512],
+        })
+    }
+
+    pub fn predict_i16(&mut self, chunk: &[i16]) -> f32 {
+        if self.f32_buf.len() != chunk.len() {
+            self.f32_buf.resize(chunk.len(), 0.0);
+        }
+        for (i, &s) in chunk.iter().enumerate() {
+            self.f32_buf[i] = (s as f32) / 32768.0;
+        }
+        self.model.predict_chunk(&self.f32_buf).unwrap_or(0.0)
+    }
+
+    pub fn predict_f32(&mut self, chunk: &[f32]) -> f32 {
+        self.model.predict_chunk(chunk).unwrap_or(0.0)
+    }
+
+    pub fn reset(&mut self) {
+        self.model.reset_states();
+    }
 }

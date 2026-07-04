@@ -42,3 +42,25 @@ fn test_regression_probs() {
 
     println!("All {} regression test chunks matched successfully within tolerance of {}!", expected_probs.len(), tolerance);
 }
+
+#[test]
+fn test_detector_api() {
+    use silero_vad_rust::Detector;
+
+    let mut detector = Detector::default();
+    
+    // Create dummy 256-sample and 512-sample buffers
+    let chunk_256 = vec![0i16; 256];
+    let chunk_512 = vec![0i16; 512];
+
+    // Predict 256-sample chunk
+    let prob1 = detector.predict_i16(&chunk_256);
+    assert!(prob1 >= 0.0 && prob1 <= 1.0, "Probability must be in range [0, 1], got {}", prob1);
+
+    // Predict 512-sample chunk
+    let prob2 = detector.predict_i16(&chunk_512);
+    assert!(prob2 >= 0.0 && prob2 <= 1.0, "Probability must be in range [0, 1], got {}", prob2);
+
+    // Verify reset works
+    detector.reset();
+}
